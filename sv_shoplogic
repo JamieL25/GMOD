@@ -1,0 +1,348 @@
+-- sv_shoplogic.lua - Server v1.25 Full
+print("[Shop Debug] sv_shoplogic.lua v1.25 starting")
+
+-- Network strings
+util.AddNetworkString("BuyWeapon")
+util.AddNetworkString("SendShopBlacklist")
+util.AddNetworkString("SendShopCategoryOverrides")
+util.AddNetworkString("SendOwnedWeapons")
+util.AddNetworkString("EquipWeapon")
+util.AddNetworkString("UpdateCurrency")
+util.AddNetworkString("BuyAmmo") -- New network string for ammo purchases
+
+-- Configuration
+local SHOP_CONFIG = {
+    StartingMoney = 5000,
+    BlacklistedWeapons = {
+        -- Add any weapons you want to prevent from appearing
+    },
+    CategoryOverrides = {
+        -- Override weapon categories manually
+        -- ["weapon_class"] = "rifles", -- Valid values: rifles, pistols, other
+    }
+}
+
+-- Player Tables
+local PlayerOwnedWeapons = {}
+
+-- Helper Functions
+local function IsWeaponOwned(ply, weaponClass)
+    if not PlayerOwnedWeapons[ply:SteamID()] then return false end
+    return PlayerOwnedWeapons[ply:SteamID()][weaponClass] == true
+end
+
+local function AddOwnedWeapon(ply, weaponClass)
+    if not PlayerOwnedWeapons[ply:SteamID()] then
+        PlayerOwnedWeapons[ply:SteamID()] = {}
+    end
+    PlayerOwnedWeapons[ply:SteamID()][weaponClass] = true
+    print("[Shop Debug] " .. ply:Nick() .. " now owns " .. weaponClass)
+end
+
+local function SendOwnedWeapons(ply)
+    if not IsValid(ply) then return end
+    
+    if not PlayerOwnedWeapons[ply:SteamID()] then
+        PlayerOwnedWeapons[ply:SteamID()] = {}
+    end
+    
+    print("[Shop Debug] Sending " .. ply:Nick() .. " their owned weapons: " ..
+          table.Count(PlayerOwnedWeapons[ply:SteamID()]) .. " items")
+    
+    for weapon, _ in pairs(PlayerOwnedWeapons[ply:SteamID()]) do
+        print("  - " .. weapon)
+    end
+          
+    net.Start("SendOwnedWeapons")
+    net.WriteTable(PlayerOwnedWeapons[ply:SteamID()])
+    net.Send(ply)
+end
+
+-- Add debug command to force resend owned weapons
+concommand.Add("shop_debug_owned", function(ply)
+    if not IsValid(ply) then return end
+    print("[Shop Debug] Admin " .. ply:Nick() .. " requested owned weapons refresh")
+    SendOwnedWeapons(ply)
+end)
+
+-- Player initialization
+hook.Add("PlayerInitialSpawn", "WeaponShopInit", function(ply)
+    -- Initialize player with starting money if they don't have any
+    if ply:GetNWInt("Currency", -1) == -1 then
+        ply:SetNWInt("Currency", SHOP_CONFIG.StartingMoney)
+    end
+    
+    -- Create player's owned weapons table if it doesn't exist
+    if not PlayerOwnedWeapons[ply:SteamID()] then
+        PlayerOwnedWeapons[ply:SteamID()] = {}
+        
+        -- Give a starter weapon for testing
+        if table.IsEmpty(PlayerOwnedWeapons[ply:SteamID()]) then
+            PlayerOwnedWeapons[ply:SteamID()]["cw_ar15"] = true
+            print("[Shop Debug] Gave starter weapon to " .. ply:Nick())
+        end
+    end
+    
+    -- Send configuration to player
+    timer.Simple(2, function()
+        if not IsValid(ply) then return end
+        
+        -- Send blacklist
+        net.Start("SendShopBlacklist")
+        net.WriteTable(SHOP_CONFIG.BlacklistedWeapons)
+        net.Send(ply)
+        
+        -- Send category overrides
+        net.Start("SendShopCategoryOverrides")
+        net.WriteTable(SHOP_CONFIG.CategoryOverrides)
+        net.Send(ply)
+        
+        -- Send owned weapons
+        SendOwnedWeapons(ply)
+        
+        -- Send current money
+        net.Start("UpdateCurrency")
+        net.WriteInt(ply:GetNWInt("Currency", SHOP_CONFIG.StartingMoney), 32)
+        net.Send(ply)
+    end)
+    
+    -- Send a second time after a delay to ensure it goes through
+    timer.Simple(5, function()
+        if not IsValid(ply) then return end
+        SendOwnedWeapons(ply)
+    end)
+end)
+
+-- Handle weapon purchase requests
+net.Receive("BuyWeapon", function(_, ply)
+    local weaponClass = net.ReadString()
+    local price = net.ReadInt(32)
+    
+    -- Basic validation
+    if not IsValid(ply) or not weaponClass or price <= 0 then return end
+    
+    print("[Shop Debug] " .. ply:Nick() .. " is attempting to buy " .. weaponClass .. " for £" .. price)
+    
+    -- Check if weapon is blacklisted
+    for _, blacklistedWeapon in ipairs(SHOP_CONFIG.BlacklistedWeapons) do
+        if blacklistedWeapon == weaponClass then
+            ply:ChatPrint("This weapon is not available for purchase!")
+            return
+        end
+    end
+    
+    -- Check if already owned
+    if IsWeaponOwned(ply, weaponClass) then
+        ply:ChatPrint("You already own this weapon!")
+        return
+    end
+    
+    -- Check if player has enough money
+    local playerMoney = ply:GetNWInt("Currency", 0)
+    if playerMoney < price then
+        ply:ChatPrint("You don't have enough money! You need £" .. price)
+        return
+    end
+    
+    -- Process purchase
+    ply:SetNWInt("Currency", playerMoney - price)
+    AddOwnedWeapon(ply, weaponClass)
+    
+    -- Notify player
+    ply:ChatPrint("You purchased " .. weaponClass .. " for £" .. price)
+    ply:EmitSound("items/ammopickup.wav")
+    
+    -- Send updated owned weapons list
+    SendOwnedWeapons(ply)
+    
+    -- Send updated currency
+    net.Start("UpdateCurrency")
+    net.WriteInt(playerMoney - price, 32)
+    net.Send(ply)
+    
+    -- Automatically equip the purchased weapon
+    ply:Give(weaponClass)
+    ply:SelectWeapon(weaponClass)
+end)
+
+-- Handle weapon equip requests
+net.Receive("EquipWeapon", function(_, ply)
+    local weaponClass = net.ReadString()
+    
+    -- Basic validation
+    if not IsValid(ply) or not weaponClass then return end
+    
+    -- Check if owned
+    if not IsWeaponOwned(ply, weaponClass) then
+        ply:ChatPrint("You don't own this weapon!")
+        return
+    end
+    
+    -- Equip weapon
+    ply:Give(weaponClass)
+    ply:SelectWeapon(weaponClass)
+    ply:ChatPrint("Equipped " .. weaponClass)
+end)
+
+-- Ammo purchase handler
+net.Receive("BuyAmmo", function(_, ply)
+    if not IsValid(ply) then return end
+    
+    -- Get current weapon
+    local wep = ply:GetActiveWeapon()
+    if not IsValid(wep) then
+        ply:ChatPrint("No weapon equipped!")
+        return
+    end
+    
+    -- Check player has enough money
+    local ammoCost = 25
+    local playerMoney = ply:GetNWInt("Currency", 0)
+    
+    if playerMoney < ammoCost then
+        ply:ChatPrint("Not enough money! You need £" .. ammoCost)
+        return
+    end
+    
+    -- Determine ammo type for the weapon
+    local ammoType
+    
+    -- For CW2.0 weapons
+    if string.StartWith(wep:GetClass(), "cw_") then
+        ammoType = wep.Primary and wep.Primary.Ammo
+    end
+    
+    -- For FA:S 2 weapons
+    if string.StartWith(wep:GetClass(), "fas2_") then
+        ammoType = wep.Primary and wep.Primary.Ammo
+    end
+    
+    if not ammoType then
+        ammoType = wep.Primary and wep.Primary.Ammo
+    end
+    
+    if not ammoType then
+        ply:ChatPrint("Cannot determine ammo type for this weapon!")
+        return
+    end
+    
+    -- Process ammo purchase
+    ply:SetNWInt("Currency", playerMoney - ammoCost)
+    
+    -- Determine ammo amount based on weapon type
+    local ammoAmount = 30  -- Default ammo amount
+    
+    -- Adjust amount based on weapon class or ammo type
+    local weaponClass = wep:GetClass():lower()
+    if weaponClass:find("pistol") or weaponClass:find("glock") or 
+       weaponClass:find("deagle") or ammoType:find("pistol") then
+        ammoAmount = 15  -- Less ammo for pistols
+    elseif weaponClass:find("sniper") or weaponClass:find("awp") or
+           weaponClass:find("m14") or weaponClass:find("m82") then
+        ammoAmount = 10  -- Even less for sniper rifles
+    elseif weaponClass:find("shotgun") or ammoType:find("buckshot") then
+        ammoAmount = 8   -- Shotgun shells
+    end
+    
+    -- Give the ammo to the player
+    ply:GiveAmmo(ammoAmount, ammoType, true)
+    
+    -- Sound and notification
+    ply:EmitSound("items/ammo_pickup.wav")
+    ply:ChatPrint("Purchased " .. ammoAmount .. " rounds of " .. ammoType .. " ammo for £" .. ammoCost)
+    
+    -- Debug logging
+    print("[Shop Debug] " .. ply:Nick() .. " purchased " .. ammoAmount .. " rounds of " .. 
+          ammoType .. " ammo for £" .. ammoCost)
+    
+    -- Send updated currency
+    net.Start("UpdateCurrency")
+    net.WriteInt(playerMoney - ammoCost, 32)
+    net.Send(ply)
+end)
+
+-- Admin commands for testing
+concommand.Add("shop_givemoney", function(ply, cmd, args)
+    if not IsValid(ply) or not ply:IsAdmin() then return end
+    
+    local amount = tonumber(args[1]) or 1000
+    local targetPly = ply
+    
+    if args[2] then
+        local targets = player.GetAll()
+        for _, target in ipairs(targets) do
+            if target:Nick():lower():find(args[2]:lower()) then
+                targetPly = target
+                break
+            end
+        end
+    end
+    
+    local currentMoney = targetPly:GetNWInt("Currency", 0)
+    targetPly:SetNWInt("Currency", currentMoney + amount)
+    
+    ply:ChatPrint("Gave £" .. amount .. " to " .. targetPly:Nick())
+    targetPly:ChatPrint("Received £" .. amount .. " from admin")
+    
+    -- Update client
+    net.Start("UpdateCurrency")
+    net.WriteInt(currentMoney + amount, 32)
+    net.Send(targetPly)
+end)
+
+concommand.Add("shop_setmoney", function(ply, cmd, args)
+    if not IsValid(ply) or not ply:IsAdmin() then return end
+    
+    local amount = tonumber(args[1]) or 5000
+    local targetPly = ply
+    
+    if args[2] then
+        local targets = player.GetAll()
+        for _, target in ipairs(targets) do
+            if target:Nick():lower():find(args[2]:lower()) then
+                targetPly = target
+                break
+            end
+        end
+    end
+    
+    targetPly:SetNWInt("Currency", amount)
+    
+    ply:ChatPrint("Set £" .. amount .. " for " .. targetPly:Nick())
+    targetPly:ChatPrint("Your money was set to £" .. amount .. " by admin")
+    
+    -- Update client
+    net.Start("UpdateCurrency")
+    net.WriteInt(amount, 32)
+    net.Send(targetPly)
+end)
+
+-- Admin command to reset a player's owned weapons
+concommand.Add("shop_reset_owned", function(ply, cmd, args)
+    if not IsValid(ply) or not ply:IsAdmin() then return end
+    
+    local targetPly = ply
+    if args[1] then
+        local targets = player.GetAll()
+        for _, target in ipairs(targets) do
+            if target:Nick():lower():find(args[1]:lower()) then
+                targetPly = target
+                break
+            end
+        end
+    end
+    
+    -- Reset owned weapons
+    PlayerOwnedWeapons[targetPly:SteamID()] = {}
+    
+    -- Add a starter weapon
+    PlayerOwnedWeapons[targetPly:SteamID()]["cw_ar15"] = true
+    
+    -- Send updated owned weapons
+    SendOwnedWeapons(targetPly)
+    
+    ply:ChatPrint("Reset owned weapons for " .. targetPly:Nick())
+    targetPly:ChatPrint("Your owned weapons have been reset by an admin")
+end)
+
+print("[Shop Debug] sv_shoplogic.lua v1.25 loaded with ammo purchase functionality")
