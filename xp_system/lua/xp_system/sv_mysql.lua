@@ -12,9 +12,9 @@ require("mysqloo")
 XPSystem.MySQL.Config = {
     host = "localhost",
     port = 3306,
-    database = "xp_system",
-    user = "bguser",
-    password = "@Ly%!98@P%Eb!OM465xs",
+    database = "",
+    user = "",
+    password = "",
     charset = "utf8mb4"
 }
 
